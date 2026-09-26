@@ -2,10 +2,11 @@ import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { parseFormula, ParseError } from './chem/parse.js';
+import { parseFormula, ParseError, ELEMENTS } from './chem/parse.js';
 import { balanceEquation } from './chem/balance.js';
 import { parseBound, analyzeFeed } from './chem/feed.js';
 import { checkObservation } from './chem/observe.js';
+import { analyzeElementFlow } from './chem/elementflow.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -360,6 +361,192 @@ app.post('/api/observation-check', (req, res) => {
     },
   });
 });
+
+// 元素来源去向：在唯一正系数配平结果上选定一种元素，按“反应物 → 生成物”
+// 勾选允许的转移关系，服务端用 BigInt 整数最大流判断非负整数分配是否存在，
+// 可行时给出一组分配及每条允许关系在全部可行分配中的最小/最大原子数。
+app.post('/api/element-flow', (req, res) => {
+  const body = req.body ?? {};
+  const { errors, parsed } = parseSides(body);
+  if (errors.length > 0) return res.json({ ok: false, errors });
+
+  const result = balanceEquation(parsed.left, parsed.right);
+  if (result.status !== 'balanced') {
+    return res.json({
+      ok: false,
+      errors: [
+        {
+          side: 'left',
+          index: -1,
+          position: null,
+          message:
+            result.status === 'not-unique'
+              ? '该反应配平系数不唯一，元素来源去向仅对唯一正系数解开放'
+              : '该反应无全部为正的配平系数，无法分析元素来源去向',
+        },
+      ],
+    });
+  }
+
+  const globalError = (message) =>
+    res.json({ ok: false, errors: [{ side: 'left', index: -1, position: null, message }] });
+
+  // 校验所选元素：必须为合法元素符号，且在配平式两侧同时出现。
+  const element = typeof body.element === 'string' ? body.element.trim() : '';
+  if (element === '') return globalError('请先选择一种元素');
+  if (!ELEMENTS.has(element)) return globalError(`“${element}”不是合法的元素符号`);
+  const inLeft = result.composition.left.some((m) => element in m);
+  const inRight = result.composition.right.some((m) => element in m);
+  if (!inLeft || !inRight) {
+    return globalError(`元素 ${element} 不在反应式两侧同时出现，无法分析来源去向`);
+  }
+
+  // 仅保留含所选元素的物质（下标保留对原始列表的索引）。
+  const leftItems = parsed.left
+    .map((counts, index) => ({
+      index,
+      per: BigInt(counts.get(element) || 0n),
+      coef: BigInt(result.coefficients.left[index]),
+    }))
+    .filter((x) => x.per > 0n)
+    .map((x) => ({ ...x, total: x.per * x.coef }));
+  const rightItems = parsed.right
+    .map((counts, index) => ({
+      index,
+      per: BigInt(counts.get(element) || 0n),
+      coef: BigInt(result.coefficients.right[index]),
+    }))
+    .filter((x) => x.per > 0n)
+    .map((x) => ({ ...x, total: x.per * x.coef }));
+
+  const leftNames = (body.left ?? []).map((f) => String(f).trim());
+  const rightNames = (body.right ?? []).map((f) => String(f).trim());
+
+  const substances = {
+    left: leftItems.map((x) => ({
+      index: x.index,
+      formula: leftNames[x.index],
+      coefficient: x.coef.toString(),
+      perMolecule: x.per.toString(),
+      atoms: x.total.toString(),
+    })),
+    right: rightItems.map((x) => ({
+      index: x.index,
+      formula: rightNames[x.index],
+      coefficient: x.coef.toString(),
+      perMolecule: x.per.toString(),
+      atoms: x.total.toString(),
+    })),
+  };
+
+  // 原始下标 → 过滤后局部下标
+  const leftLocal = new Map(leftItems.map((x, k) => [x.index, k]));
+  const rightLocal = new Map(rightItems.map((x, k) => [x.index, k]));
+
+  // 校验允许转移关系
+  const rawEdges = body.edges;
+  if (rawEdges === undefined || rawEdges === null) {
+    return jsonFlowNoEdges(res, result, element, substances);
+  }
+  if (!Array.isArray(rawEdges)) return globalError('转移关系列表格式不正确');
+
+  const edgeSet = new Set();
+  const edges = [];
+  for (const e of rawEdges) {
+    if (e === null || typeof e !== 'object' || !Number.isInteger(e.left) || !Number.isInteger(e.right)) {
+      return globalError('每条转移关系必须含整数下标 left（反应物）与 right（生成物）');
+    }
+    if (!leftLocal.has(e.left)) return globalError(`左侧第 ${e.left + 1} 个物质不含元素 ${element}，不能作为来源`);
+    if (!rightLocal.has(e.right)) return globalError(`右侧第 ${e.right + 1} 个物质不含元素 ${element}，不能作为去向`);
+    const li = leftLocal.get(e.left);
+    const rj = rightLocal.get(e.right);
+    const key = `${li}:${rj}`;
+    if (edgeSet.has(key)) return globalError('转移关系不能重复勾选');
+    edgeSet.add(key);
+    edges.push([li, rj]);
+  }
+  if (edges.length === 0) return jsonFlowNoEdges(res, result, element, substances);
+  if (edges.length > 400) return globalError('允许的转移关系数量不能超过 400');
+
+  const outcome = analyzeElementFlow(
+    leftItems.map((x) => x.total),
+    rightItems.map((x) => x.total),
+    edges
+  );
+
+  if (outcome.status === 'infeasible') {
+    const { hall } = outcome;
+    const pNames = hall.products.map((j) => substances.right[j].formula).join('、');
+    const rNames =
+      hall.reactants.length > 0
+        ? hall.reactants.map((i) => substances.left[i].formula).join('、')
+        : '（无）';
+    const flow = {
+      status: 'infeasible',
+      message:
+        `无法完成分配：生成物 ${pNames} 共需 ${hall.demand.toString()} 个 ${element} 原子，` +
+        `但允许向其供货的反应物（${rNames}）总共只有 ${hall.supply.toString()} 个，` +
+        '原子无法同时满足每种物质转出/转入之和等于其原子总数。请增加允许的转移关系。',
+      hall: {
+        products: hall.products.map((j) => substances.right[j].index),
+        reactants: hall.reactants.map((i) => substances.left[i].index),
+        demand: hall.demand.toString(),
+        supply: hall.supply.toString(),
+      },
+    };
+    return res.json({
+      ok: true,
+      result: {
+        status: 'balanced',
+        coefficients: result.coefficients,
+        element,
+        substances,
+        flow,
+      },
+    });
+  }
+
+  const allocations = edges.map(([i, j], k) => ({
+    left: substances.left[i].index,
+    right: substances.right[j].index,
+    amount: outcome.flows[k].toString(),
+    min: outcome.bounds[k].min.toString(),
+    max: outcome.bounds[k].max.toString(),
+  }));
+
+  res.json({
+    ok: true,
+    result: {
+      status: 'balanced',
+      coefficients: result.coefficients,
+      element,
+      substances,
+      flow: {
+        status: 'feasible',
+        total: outcome.total.toString(),
+        message: `可以完成分配：存在一组非负整数转移量，使每种物质的转出/转入之和恰为其 ${element} 原子总数。下表给出一组分配，并列出每条允许关系在全部可行分配中的最小、最大原子数。`,
+        allocations,
+      },
+    },
+  });
+});
+
+// 未勾选任何允许关系：业务上提示先勾选（HTTP 层仍为 ok:true）。
+function jsonFlowNoEdges(res, result, element, substances) {
+  return res.json({
+    ok: true,
+    result: {
+      status: 'balanced',
+      coefficients: result.coefficients,
+      element,
+      substances,
+      flow: {
+        status: 'no-edges',
+        message: '尚未勾选任何允许的转移关系：请在矩阵中勾选“反应物 → 生成物”的允许去向，再进行分配判定。',
+      },
+    },
+  });
+}
 
 // 生产模式：托管前端构建产物
 const dist = path.join(__dirname, '..', 'client', 'dist');

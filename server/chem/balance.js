@@ -125,6 +125,10 @@ export function balanceEquation(leftCounts, rightCounts) {
     return { symbol: el, left: toJsonNumber(l), right: toJsonNumber(rr) };
   });
 
+  // 各物质中每种元素的单分子原子数（供元素来源去向等模块按元素筛选物质）
+  const compositionOf = (counts) =>
+    Object.fromEntries([...counts.entries()].map(([el, c]) => [el, toJsonNumber(BigInt(c))]));
+
   return {
     status: 'balanced',
     coefficients: {
@@ -132,5 +136,9 @@ export function balanceEquation(leftCounts, rightCounts) {
       right: ints.slice(nLeft).map(toJsonNumber),
     },
     elements: elementRows,
+    composition: {
+      left: leftCounts.map(compositionOf),
+      right: rightCounts.map(compositionOf),
+    },
   };
 }

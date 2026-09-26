@@ -235,6 +235,7 @@ export default function App() {
             left={left.map((f) => f.trim())}
             right={right.map((f) => f.trim())}
             coefficients={result.coefficients}
+            composition={result.composition}
           />
         </div>
       )}
