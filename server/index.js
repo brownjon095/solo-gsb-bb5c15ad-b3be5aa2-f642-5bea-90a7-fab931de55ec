@@ -2,10 +2,11 @@ import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { parseFormula, ParseError } from './chem/parse.js';
+import { parseFormula, ParseError, ELEMENTS } from './chem/parse.js';
 import { balanceEquation } from './chem/balance.js';
 import { parseBound, analyzeFeed } from './chem/feed.js';
 import { checkObservation } from './chem/observe.js';
+import { flowLayout, solveElementFlow } from './chem/flow.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -162,6 +163,54 @@ function parseObservations(raw, count, side, section, label) {
 
   if (errors.length > 0) return { errors, obs: null };
   return { errors: [], obs };
+}
+
+// 允许关系校验：[{reactant, product}] 为原始下标，须在范围内且两端物质
+// 均含所选元素；重复关系去重。
+function parseArcs(raw, leftCount, rightCount, layout) {
+  const errors = [];
+  const push = (message) =>
+    errors.push({ side: 'left', index: -1, section: 'flow', field: null, message });
+
+  if (!Array.isArray(raw)) {
+    push('允许关系格式不正确');
+    return { errors, arcs: null };
+  }
+
+  const rSet = new Set(layout.reactants.map((r) => r.index));
+  const pSet = new Set(layout.products.map((p) => p.index));
+  const seen = new Set();
+  const arcs = [];
+  raw.forEach((arc, k) => {
+    if (arc === null || typeof arc !== 'object') {
+      push(`第 ${k + 1} 条允许关系格式不正确`);
+      return;
+    }
+    const { reactant, product } = arc;
+    if (
+      !Number.isInteger(reactant) ||
+      reactant < 0 ||
+      reactant >= leftCount ||
+      !Number.isInteger(product) ||
+      product < 0 ||
+      product >= rightCount
+    ) {
+      push(`第 ${k + 1} 条允许关系的物质下标超出范围`);
+      return;
+    }
+    if (!rSet.has(reactant) || !pSet.has(product)) {
+      push(`第 ${k + 1} 条允许关系涉及不含所选元素的物质`);
+      return;
+    }
+    const key = `${reactant}-${product}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      arcs.push({ reactant, product });
+    }
+  });
+
+  if (errors.length > 0) return { errors, arcs: null };
+  return { errors: [], arcs };
 }
 
 const fracText = ({ num, den }) => (den === '1' ? num : `${num}/${den}`);
@@ -356,6 +405,122 @@ app.post('/api/observation-check', (req, res) => {
         limitingIndex: check.limitingIndex,
         message: `观测可行：存在同一组投料与反应进度满足全部观测，且 ${leftNames[check.limitingIndex]} 完全耗尽。下面给出一组见证（单位 mol）。`,
         witness: check.witness,
+      },
+    },
+  });
+});
+
+// 元素来源去向：在唯一正系数解上选定一种元素，列出其在各反应物/生成物中的
+// 原子总数（计入系数）；把用户勾选的允许关系上的转移量视为非负整数，要求每种
+// 物质转出/转入之和等于其原子总数，判定可行性并求各关系的最小/最大转移量。
+app.post('/api/element-flow', (req, res) => {
+  const body = req.body ?? {};
+  const { errors, parsed } = parseSides(body);
+  if (errors.length > 0) return res.json({ ok: false, errors });
+
+  const result = balanceEquation(parsed.left, parsed.right);
+  if (result.status !== 'balanced') {
+    return res.json({
+      ok: false,
+      errors: [
+        {
+          side: 'left',
+          index: -1,
+          position: null,
+          message:
+            result.status === 'not-unique'
+              ? '该反应配平系数不唯一，元素来源去向分析仅对唯一正系数解开放'
+              : '该反应无全部为正的配平系数，无法进行元素来源去向分析',
+        },
+      ],
+    });
+  }
+
+  const element = typeof body.element === 'string' ? body.element.trim() : '';
+  if (!element || !ELEMENTS.has(element)) {
+    return res.json({
+      ok: false,
+      errors: [
+        { side: 'left', index: -1, position: null, message: '请指定要追踪的元素符号（区分大小写）' },
+      ],
+    });
+  }
+  if (!result.elements.some((e) => e.symbol === element)) {
+    return res.json({
+      ok: false,
+      errors: [
+        { side: 'left', index: -1, position: null, message: `元素 ${element} 未出现在该反应中` },
+      ],
+    });
+  }
+
+  const layout = flowLayout(
+    result.coefficients.left,
+    result.coefficients.right,
+    parsed.left,
+    parsed.right,
+    element
+  );
+  const base = {
+    status: 'balanced',
+    coefficients: result.coefficients,
+    element,
+    layout,
+  };
+
+  // 未提供允许关系：仅返回布局（各物质原子总数），供前端渲染勾选矩阵
+  if (body.arcs == null) {
+    return res.json({ ok: true, result: { ...base, flow: null } });
+  }
+
+  const { errors: arcErrors, arcs } = parseArcs(
+    body.arcs,
+    parsed.left.length,
+    parsed.right.length,
+    layout
+  );
+  if (arcErrors.length > 0) return res.json({ ok: false, errors: arcErrors });
+
+  if (arcs.length === 0) {
+    return res.json({
+      ok: true,
+      result: {
+        ...base,
+        flow: {
+          status: 'no-arcs',
+          message: '尚未勾选任何允许关系：请至少勾选一条反应物到生成物的转移关系。',
+        },
+      },
+    });
+  }
+
+  const flow = solveElementFlow(layout, arcs);
+
+  if (!flow.feasible) {
+    return res.json({
+      ok: true,
+      result: {
+        ...base,
+        flow: {
+          status: 'infeasible',
+          message:
+            '按当前勾选的允许关系无法完成分配：下列物质的原子无论如何分配都无法全部转出/转入，请补勾相应关系。',
+          leftover: flow.leftover,
+          unmet: flow.unmet,
+        },
+      },
+    });
+  }
+
+  res.json({
+    ok: true,
+    result: {
+      ...base,
+      flow: {
+        status: 'feasible',
+        message:
+          '可以完成分配：下面给出一组分配，并列出每条允许关系在全部可行分配中的最小、最大转移原子数。',
+        arcs: flow.arcs,
       },
     },
   });

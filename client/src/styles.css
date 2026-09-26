@@ -669,3 +669,82 @@ footer {
 .obs-verdict .feed-table {
   margin-top: 10px;
 }
+
+/* ---- 元素来源去向 ---- */
+.flow-section {
+  border-top-style: dashed;
+}
+
+.flow-element-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.flow-element-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.el-select {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 14px;
+  background: #fff;
+  color: var(--ink);
+  outline: none;
+}
+
+.el-select:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 2px rgba(47, 111, 237, 0.15);
+}
+
+.flow-matrix-hint {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.8;
+  margin: 0 0 10px;
+}
+
+.flow-matrix th,
+.flow-matrix td {
+  text-align: center;
+}
+
+.flow-matrix .flow-corner {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 400;
+}
+
+.flow-matrix input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--blue);
+  cursor: pointer;
+}
+
+.flow-atoms {
+  display: block;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.flow-arrow {
+  color: var(--muted);
+}
+
+.flow-btn {
+  background: var(--blue);
+}
+
+.flow-btn:hover:not(:disabled) {
+  background: var(--blue-dark);
+  filter: none;
+}

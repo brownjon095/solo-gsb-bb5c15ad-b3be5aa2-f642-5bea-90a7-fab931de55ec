@@ -1,6 +1,6 @@
 # 化学反应式配平网页
 
-基于 **React + Node.js (Express)** 的化学反应式配平工具。用户在左右两侧分别输入反应物与生成物的化学式，服务端构建元素守恒矩阵，使用**精确有理数（BigInt 分数）消元**求解，仅在零空间为一维且全部系数严格为正时输出最大公约数为 1 的最简整数系数。配平成功后还可进行**投料区间分析**：在各反应物投料量的独立区间上，用精确有理数联合计算完全反应后生成物生成量、反应物剩余量的可达范围，并标出每种物质是否限量。此外可进行**实验观测核验**：沿用配平结果与投料区间，为生成物的实际生成量、反应物的实际剩余量填写可选观测闭区间，服务端用精确有理数**联合**判断是否存在同一组投料与反应进度满足全部观测（且至少一种反应物耗尽），可行时给出见证，不可行时指出观测冲突。
+基于 **React + Node.js (Express)** 的化学反应式配平工具。用户在左右两侧分别输入反应物与生成物的化学式，服务端构建元素守恒矩阵，使用**精确有理数（BigInt 分数）消元**求解，仅在零空间为一维且全部系数严格为正时输出最大公约数为 1 的最简整数系数。配平成功后还可进行**投料区间分析**：在各反应物投料量的独立区间上，用精确有理数联合计算完全反应后生成物生成量、反应物剩余量的可达范围，并标出每种物质是否限量。此外可进行**实验观测核验**：沿用配平结果与投料区间，为生成物的实际生成量、反应物的实际剩余量填写可选观测闭区间，服务端用精确有理数**联合**判断是否存在同一组投料与反应进度满足全部观测（且至少一种反应物耗尽），可行时给出见证，不可行时指出观测冲突。还可进行**元素来源去向**分析：选择配平式中的一种元素，列出其在各反应物、生成物中的原子总数（计入系数），勾选允许的反应物到生成物转移关系后，服务端用 **BigInt 最小费用最大流**判断能否把每种物质的原子全部转出/转入（每条关系的转移量为非负整数），可行时给出一组分配，并求每条允许关系在全部可行分配中的最小、最大原子数，不可行时指出无法转出/转入的物质与原子数。
 
 ## 一键启动
 
@@ -18,6 +18,7 @@ docker compose up --build
 - 配平接口：`POST http://localhost:3000/api/balance`
 - 投料区间分析接口：`POST http://localhost:3000/api/feed-analysis`
 - 实验观测核验接口：`POST http://localhost:3000/api/observation-check`
+- 元素来源去向接口：`POST http://localhost:3000/api/element-flow`
 
 如需修改端口，编辑 `docker-compose.yml` 中的 `"宿主端口:3000"`（容器内固定监听 `PORT=3000`）。停止服务：`Ctrl+C`；后台运行：`docker compose up --build -d`。
 
@@ -48,6 +49,12 @@ docker compose up --build
   - 固定某个限量反应物后，所有观测约束都化为 ξ 的一维闭区间交（生成物 ξ ∈ [aⱼ/cⱼ, bⱼ/cⱼ]；反应物由 nᵢ = cᵢξ + rᵢ ∈ [Lᵢ,Uᵢ] 给出界），逐个候选检查
   - 返回**可行**（`feasible`）并附一组见证（ξ、各 nᵢ 投料、各剩余量、各生成量）；**不可行**（`infeasible`）时区分共同约束矛盾（`joint`）与没有任何物质能耗尽（`exhaustion`），并给出带物质名称的冲突说明；一项观测都没填时返回 `no-observation` 提示补填
   - 结论以约分分数展示；修改投料或观测输入会立即清除上一次核验结果
+- **元素来源去向（仅对唯一正系数解开放）**：
+  - 从配平式中选择一种元素，系统列出该元素在**各反应物、生成物中的原子总数**（计入系数），**仅展示含该元素的物质**
+  - 在行（反应物，转出）与列（生成物，转入）交叉处**勾选允许的转移关系**；每条关系的转移量视为**非负整数**，要求每种物质的转出/转入之和恰好等于其原子总数
+  - 服务端把该问题化为运输问题，用 **BigInt 最小费用最大流**精确求解：约束矩阵全单位模且各原子总数为整数，故线性松弛可行 ⟺ 存在非负整数分配，且每条关系的最小/最大转移量都是整数
+  - **可行**时给出一组分配，并逐条列出允许关系在**全部可行分配**中的最小、最大转移原子数；**不可行**时指出每种物质无论如何分配都无法转出（剩余）/转入（缺口）的原子数，便于补勾关系
+  - **修改反应式或更换元素会立即清除勾选与求解结果**
 
 ## 本地开发（可选）
 
@@ -73,19 +80,21 @@ cd server && npm test
 ├── Dockerfile            # 多阶段构建：前端构建 + 后端依赖 + 运行镜像
 ├── docker-compose.yml    # 单服务，映射 3000 端口
 ├── server/
-│   ├── index.js          # Express 入口：/api/balance、/api/feed-analysis、/api/observation-check、静态托管
+│   ├── index.js          # Express 入口：/api/balance、/api/feed-analysis、/api/observation-check、/api/element-flow、静态托管
 │   └── chem/
 │       ├── fraction.js   # 精确有理数（BigInt）
 │       ├── parse.js      # 化学式递归下降解析器（含错误定位）
 │       ├── balance.js    # 元素守恒矩阵 + RREF 消元 + 零空间判定
 │       ├── feed.js       # 投料区间分析：联合求界与限量判定（有理数）
-│       └── observe.js    # 实验观测核验：同一组投料/进度的区间交联合判定
+│       ├── observe.js    # 实验观测核验：同一组投料/进度的区间交联合判定
+│       └── flow.js       # 元素来源去向：BigInt 最小费用最大流（转移分配与逐边最小/最大）
 └── client/
     └── src/
         ├── App.jsx               # 输入面板、示例、结果展示
-        ├── BalanceTools.jsx      # 配平结果区：共享投料区间，串联两个分析模块
+        ├── BalanceTools.jsx      # 配平结果区：共享投料区间，串联三个分析模块
         ├── FeedAnalysis.jsx      # 投料区间输入、分析结果与限量标注
         ├── ObservationCheck.jsx  # 实验观测输入、核验结论与见证展示
+        ├── ElementFlow.jsx       # 元素选择、转移关系勾选矩阵、分配结果展示
         ├── FracText.jsx          # 约分分数竖排渲染
         ├── FormulaText.jsx       # 化学式数字下标渲染
         └── styles.css
@@ -212,3 +221,81 @@ HTTP 层 `ok` 恒为 `true`（语法/区间校验失败时仍为 `ok:false`，�
 - **补填提示**（`no-observation`）：所有观测项均留空时返回，`message` 提示至少补填一项观测。
 
 > 核验是对**同一组** (nᵢ, ξ) 的联合可满足性判定（区间交），不是把各观测与可达范围逐项独立比对；例如生成物观测与剩余量观测可能各自落在可达范围内，却只能由不同的 ξ 实现，此时仍判为冲突。
+
+### `POST /api/element-flow`
+
+请求体在 `balance` 的基础上增加 `element`（要追踪的元素符号，区分大小写）与可选的 `arcs`（允许关系数组，每项 `{ reactant, product }` 为 `left` / `right` 中的 0 基下标，两端物质必须都含所选元素，重复关系自动去重）。
+
+**不提供 `arcs`** 时仅返回布局：含该元素的物质及其原子总数（计入系数），供渲染勾选矩阵：
+
+```json
+{
+  "left": ["CO2", "H2O"],
+  "right": ["C6H12O6", "O2"],
+  "element": "O"
+}
+```
+
+```json
+{
+  "ok": true,
+  "result": {
+    "status": "balanced",
+    "coefficients": { "left": [6, 6], "right": [1, 6] },
+    "element": "O",
+    "layout": {
+      "reactants": [{ "index": 0, "atoms": "12" }, { "index": 1, "atoms": "6" }],
+      "products": [{ "index": 0, "atoms": "6" }, { "index": 1, "atoms": "12" }],
+      "total": "18"
+    },
+    "flow": null
+  }
+}
+```
+
+**提供 `arcs`** 时求解转移分配（原子数均为十进制字符串）：
+
+```json
+{
+  "left": ["CO2", "H2O"],
+  "right": ["C6H12O6", "O2"],
+  "element": "O",
+  "arcs": [
+    { "reactant": 0, "product": 0 },
+    { "reactant": 0, "product": 1 },
+    { "reactant": 1, "product": 0 },
+    { "reactant": 1, "product": 1 }
+  ]
+}
+```
+
+业务结论在 `result.flow.status`：
+
+- **可行**（`feasible`）：`arcs` 逐项给出每条允许关系的 `witness`（一组可行分配中的转移量）、`min` / `max`（全部可行分配中的最小/最大转移原子数）：
+
+```json
+{
+  "ok": true,
+  "result": {
+    "status": "balanced",
+    "coefficients": { "left": [6, 6], "right": [1, 6] },
+    "element": "O",
+    "layout": { "reactants": [{ "index": 0, "atoms": "12" }, { "index": 1, "atoms": "6" }], "products": [{ "index": 0, "atoms": "6" }, { "index": 1, "atoms": "12" }], "total": "18" },
+    "flow": {
+      "status": "feasible",
+      "message": "可以完成分配：下面给出一组分配，并列出每条允许关系在全部可行分配中的最小、最大转移原子数。",
+      "arcs": [
+        { "reactant": 0, "product": 0, "witness": "6", "min": "0", "max": "6" },
+        { "reactant": 0, "product": 1, "witness": "6", "min": "6", "max": "12" },
+        { "reactant": 1, "product": 0, "witness": "0", "min": "0", "max": "6" },
+        { "reactant": 1, "product": 1, "witness": "6", "min": "0", "max": "6" }
+      ]
+    }
+  }
+}
+```
+
+- **不可行**（`infeasible`）：`leftover` 列出无论如何分配都无法全部转出的反应物（`index` + 至少剩余的原子数 `atoms`），`unmet` 列出无法全部转入的生成物（`index` + 至少缺口的原子数 `atoms`）。
+- **未勾选**（`no-arcs`）：`arcs` 为空数组时返回，`message` 提示至少勾选一条允许关系。
+
+元素符号非法、未出现在反应中、关系下标越界或涉及不含该元素的物质时 `ok` 为 `false`（错误项含 `message`，关系错误另带 `section: "flow"`）；化学式语法错误、配平不唯一或无正解时的行为与 `/api/feed-analysis` 一致。
